@@ -1,0 +1,118 @@
+substitutions:
+  devicename: &device_name air-purifier
+  use_address: 192.168.0.13
+
+
+esphome:
+  platform: ESP8266
+  board: nodemcuv2
+  name: *device_name
+  includes:
+   - "custom_uart.h"
+
+
+logger:
+  level: INFO # makes uart stream available in esphome logstream
+  baud_rate: 0 # disable logging over uart
+
+uart:
+  id: uart_bus
+  rx_pin: D7
+  #  tx_pin: D0
+  baud_rate: 9600
+#  debug:
+#    direction: RX
+#    dummy_receiver: false
+#    after:
+#      bytes: 10
+#    sequence:
+#      - lambda: UARTDebug::log_int(direction, bytes, ',');
+
+sensor:
+- platform: custom
+  lambda: |-
+    auto my_custom_sensor = new UartReadLineSensor(id(uart_bus));
+    App.register_component(my_custom_sensor);
+    return {my_custom_sensor};
+  sensors:
+    name: pm25
+    id: "pm25"
+    unit_of_measurement: "μg/m3"
+    accuracy_decimals: 2
+    filters:
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 60
+    on_value:
+      then:
+          - if:
+              condition:
+                lambda: 'return id(mode).active_index() == 1;'
+              then:
+                  - script.execute: set_fan_speed
+
+output:
+  - platform: esp8266_pwm
+    pin: D1
+    frequency: 1000 Hz
+    id: pwm_output
+
+fan:
+  - platform: speed
+    output: pwm_output
+    name: "Air Purifier"
+    id: air_purifier
+    # Use a reasonable low speed_count to not change the speed all the time in auto mode.
+    speed_count: 10
+
+select:
+  - platform: template
+    name: Mode
+    id: mode
+    restore_value: true
+    initial_option: "auto"
+    options:
+     - "sleep"
+     - "auto"
+     - "manual"
+    set_action:
+      then:
+        - lambda: 'id(mode).state = x.c_str();'
+        - script.execute: set_fan_speed
+
+script:
+  - id: set_fan_speed
+    then:
+      if:
+        # Auto mode
+        condition:
+          and:
+            - lambda: 'return id(mode).active_index() == 1;'
+        then:
+          - if:
+              condition:
+                lambda: 'return id(pm25).state < 1;'
+              then:
+#                - fan.turn_off: air_purifier
+                - fan.turn_on:
+                    id: air_purifier
+                    speed: 1
+              else:
+              - fan.turn_on:
+                  id: air_purifier
+                  # Remap the pm25 state to the fan pwm speed.
+                  speed: !lambda |-
+                    return remap(id(pm25).state, 0.0f, 1000.0f , 1.0f, 10.0f);
+        else:
+          # Sleep mode
+          if:
+            condition:
+              and:
+                - lambda: 'return id(mode).active_index() == 0;'
+                - fan.is_on: air_purifier
+            then:
+              - fan.turn_on:
+                  id: air_purifier
+                  speed: 1
+
+<<: !include common.yaml
