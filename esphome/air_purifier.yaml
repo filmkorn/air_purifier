@@ -1,18 +1,21 @@
-substitutions:
-  devicename: &device_name air-purifier
-  use_address: 192.168.0.13
+esp8266:
+  board: nodemcuv2
+  restore_from_flash: true
 
+api:
+
+web_server:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
 
 esphome:
-  platform: ESP8266
-  board: nodemcuv2
-  name: *device_name
-  includes:
-   - "custom_uart.h"
-
+  min_version: "2023.12.0"
+  name: air-purifier
 
 logger:
-  level: INFO # makes uart stream available in esphome logstream
+  level: INFO # DEBUG makes uart stream available in esphome logstream
   baud_rate: 0 # disable logging over uart
 
 uart:
@@ -20,21 +23,40 @@ uart:
   rx_pin: D7
   #  tx_pin: D0
   baud_rate: 9600
-#  debug:
-#    direction: RX
-#    dummy_receiver: false
-#    after:
-#      bytes: 10
-#    sequence:
-#      - lambda: UARTDebug::log_int(direction, bytes, ',');
+  # debug:
+  #   direction: RX
+  #   dummy_receiver: false
+  #   after:
+  #     bytes: 10
+  #   sequence:
+  #     - lambda: UARTDebug::log_int(direction, bytes, ',');
+
+external_components:
+  - source: github://eigger/espcomponents@latest
+    components: [ uartex ]
+    refresh: always
+
+uartex:
+  uart_id: uart_bus
+  rx_timeout: 10ms
+  rx_header: [0xFF]
+  rx_checksum: !lambda |-
+      uint8_t sum = 0;
+      // Sum Byte 1 through 7
+      for (int i = 0; i < 7; i++) {
+        sum += data[i];
+      }
+      return (uint8_t)((~sum) + 1);
 
 sensor:
-- platform: custom
-  lambda: |-
-    auto my_custom_sensor = new UartReadLineSensor(id(uart_bus));
-    App.register_component(my_custom_sensor);
-    return {my_custom_sensor};
-  sensors:
+  - platform: uartex
+    state: []
+    state_number:
+      offset: 2
+      length: 2
+      precision: 1
+      signed: false
+      
     name: pm25
     id: "pm25"
     unit_of_measurement: "μg/m3"
@@ -42,15 +64,31 @@ sensor:
     filters:
       - exponential_moving_average:
           alpha: 0.1
-          send_every: 60
+          send_every: 30
+      - or:
+          - delta: 1.0
+          - heartbeat: 600s
     on_value:
       then:
-          - if:
-              condition:
-                lambda: 'return id(mode).active_index() == 1;'
-              then:
-                  - script.execute: set_fan_speed
+        - script.execute: set_fan_speed
 
+# We cannot use fan.set_speed from the script as that clears the preset.
+# The number converts the 0-3 speeds to a 0-1 float to set on the pwm_output. 
+number:
+  - platform: template
+    name: speed_auto
+    disabled_by_default: True
+    id: speed_auto
+    min_value: 0
+    max_value: 3
+    step: 1
+    optimistic: True
+    set_action: 
+      then:
+        output.set_level:
+          id: pwm_output
+          level: !lambda "return int(x) / 3.0f;"
+        
 output:
   - platform: esp8266_pwm
     pin: D1
@@ -62,57 +100,42 @@ fan:
     output: pwm_output
     name: "Air Purifier"
     id: air_purifier
-    # Use a reasonable low speed_count to not change the speed all the time in auto mode.
-    speed_count: 10
-
-select:
-  - platform: template
-    name: Mode
-    id: mode
-    restore_value: true
-    initial_option: "auto"
-    options:
-     - "sleep"
-     - "auto"
-     - "manual"
-    set_action:
+    restore_mode: RESTORE_DEFAULT_ON
+    # Use 3 discreet modes of the tile card.
+    speed_count: 3
+    preset_modes:
+      - auto
+      - sleep
+    on_preset_set:
       then:
-        - lambda: 'id(mode).state = x.c_str();'
         - script.execute: set_fan_speed
 
 script:
   - id: set_fan_speed
+    mode: restart
     then:
-      if:
-        # Auto mode
-        condition:
-          and:
-            - lambda: 'return id(mode).active_index() == 1;'
-        then:
-          - if:
+      - logger.log:
+          level: INFO
+          format: "Preset mode: %s"
+          args:
+            - "id(air_purifier).get_preset_mode().c_str()"
+      - if:
+          # Auto mode
+          condition:
+            - lambda: 'return (id(air_purifier).has_preset_mode() && id(air_purifier).get_preset_mode() == "auto");'
+          then:
+            - number.set:
+                id: speed_auto
+                value: !lambda |-
+                  return round(remap(id(pm25).state, 20.0f, 500.0f , 0.0f, 3.0f));
+          else:
+            # Sleep mode
+            if:
               condition:
-                lambda: 'return id(pm25).state < 1;'
+                and:
+                  - lambda: 'return (id(air_purifier).has_preset_mode() && id(air_purifier).get_preset_mode() == "sleep");'
+                  - fan.is_on: air_purifier
               then:
-#                - fan.turn_off: air_purifier
-                - fan.turn_on:
-                    id: air_purifier
-                    speed: 1
-              else:
-              - fan.turn_on:
-                  id: air_purifier
-                  # Remap the pm25 state to the fan pwm speed.
-                  speed: !lambda |-
-                    return remap(id(pm25).state, 0.0f, 1000.0f , 1.0f, 10.0f);
-        else:
-          # Sleep mode
-          if:
-            condition:
-              and:
-                - lambda: 'return id(mode).active_index() == 0;'
-                - fan.is_on: air_purifier
-            then:
-              - fan.turn_on:
-                  id: air_purifier
-                  speed: 1
-
-<<: !include common.yaml
+                - number.set:
+                    id: speed_auto
+                    value: 1.0
